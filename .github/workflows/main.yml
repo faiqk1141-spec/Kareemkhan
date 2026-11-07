@@ -1,0 +1,100 @@
+name: Run JazzDrive Bot
+
+on:
+  workflow_dispatch:      # Manual "Run workflow" button se chalao
+  schedule:
+    - cron: '7 */6 * * *'   # Har 6 ghante auto-run (UTC 00:07, 06:07, 12:07, 18:07)
+
+concurrency:
+  group: jazzdrive-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: write         # feed.json / session files push karne ke liye zaroori
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub Actions ka max ~6 ghante free tier pe
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Secrets check
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          [ -n "$BOT_TOKEN" ] || { echo "BOT_TOKEN secret missing"; exit 1; }
+          [ -n "$STATE_KEY" ] || { echo "STATE_KEY secret missing"; exit 1; }
+
+      - name: Decrypt saved session
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if [ -f data.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in data.enc | tar xzf - \
+              && echo "Session restore ho gaya" || echo "Decrypt fail (STATE_KEY galat?)"
+          else
+            echo "data.enc nahi mila - pehli baar login karna hoga"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (ffmpeg, fonts, aria2, 7zip)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg aria2 fonts-noto p7zip-full
+
+      - name: Install Deno (yt-dlp signature/nsig solver)
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Install Python dependencies
+        run: |
+          pip install -q --upgrade pip
+          pip install -q -U yt-dlp
+          pip install -q -U pytubefix
+          pip install -q pyTelegramBotAPI requests requests_toolbelt playwright urllib3 curl_cffi
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Configure git (for mid-run feed.json pushes)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run Bot
+        timeout-minutes: 335   # step pehle band ho, taake neeche session commit step zaroor chale
+        env:
+          PYTHONUNBUFFERED: "1"
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          python bot.py
+
+      - name: Encrypt and save session back to repo
+        if: always()
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          FILES=""
+          for f in state1.json yt_token.json allowed_users.json feed.json instagram_cookies.txt; do
+            [ -f "$f" ] && FILES="$FILES $f"
+          done
+          if [ -n "$FILES" ] && [ -n "$STATE_KEY" ]; then
+            tar czf - $FILES | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:STATE_KEY -out data.enc
+            git add data.enc
+            git diff --staged --quiet || git commit -m "Update encrypted session [skip ci]"
+            git pull --rebase --autostash || true
+            git push || echo "Push failed"
+          fi
